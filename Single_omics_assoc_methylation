@@ -1,0 +1,209 @@
+#!/usr/bin/env Rscript
+
+# Methylation associations with global cognitive slope in ROSMAP.
+# Each CpG is analyzed once using all eligible samples, with complete-case
+# analysis for that CpG. No resampling or internal validation is performed.
+#
+# Usage (run in a terminal):
+#   Rscript methy.globcog.slope.R [data_dir] [output_dir] [group]
+# Examples:
+#   Rscript methy.globcog.slope.R data methy_res
+#   Rscript methy.globcog.slope.R data methy_res 1
+# Omit group to analyze all CpGs. A group selects a block of 20,000 CpGs;
+# it does not select or divide participants.
+
+# 1. Dependencies and configuration --------------------------------------------
+
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  stop("Install data.table first: install.packages('data.table')")
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 3L) {
+  stop("Usage: Rscript methy.globcog.slope.R [data_dir] [output_dir] [group]")
+}
+
+data_dir <- if (length(args) >= 1L) args[1L] else "data"
+output_dir <- if (length(args) >= 2L) args[2L] else "methy_res"
+group <- if (length(args) >= 3L) suppressWarnings(as.numeric(args[3L])) else NULL
+chunk_size <- 20000L
+
+if (!is.null(group) &&
+    (!is.finite(group) || group < 1 || group != floor(group))) {
+  stop("group must be a positive integer, or omitted to analyze all CpGs.")
+}
+
+# Change these filenames if your input files have different names.
+input_paths <- c(
+  methylation = file.path(data_dir, "ROSMAP_arrayMethylation_imputed.tsv.RData"),
+  phenotype = file.path(data_dir, "Phenotype.ROSMAP.txt"),
+  cognition = file.path(data_dir, "df_LMM_Kmeans_trajectory_groups.csv"),
+  metadata = file.path(data_dir, "ROSMAP_assay_methylationArray_metadata.csv")
+)
+
+missing_files <- input_paths[!file.exists(input_paths)]
+if (length(missing_files) > 0L) {
+  stop("Missing input files:\n", paste(missing_files, collapse = "\n"))
+}
+
+check_columns <- function(x, required, label) {
+  missing <- setdiff(required, names(x))
+  if (length(missing) > 0L) {
+    stop(label, " is missing columns: ", paste(missing, collapse = ", "))
+  }
+}
+
+# 2. Load data -----------------------------------------------------------------
+
+# Load into a separate environment to avoid overwriting script variables.
+methylation_env <- new.env()
+load(input_paths[["methylation"]], envir = methylation_env)
+if (!exists("methy", envir = methylation_env, inherits = FALSE)) {
+  stop("The methylation RData file must contain an object named 'methy'.")
+}
+methy <- methylation_env$methy
+rm(methylation_env)
+if (data.table::is.data.table(methy)) {
+  data.table::setDF(methy)
+}
+if (!(is.data.frame(methy) || is.matrix(methy)) ||
+    nrow(methy) == 0L || ncol(methy) < 2L) {
+  stop("methy must have CpG IDs in column 1 and sample values in other columns.")
+}
+
+phe <- data.table::fread(
+  input_paths[["phenotype"]], data.table = FALSE,
+  colClasses = c(projid = "character", Methylation_id = "character")
+)
+cog <- data.table::fread(
+  input_paths[["cognition"]], data.table = FALSE,
+  colClasses = c(projid = "character")
+)
+minf <- data.table::fread(input_paths[["metadata"]], data.table = FALSE)
+
+cognition_columns <- c(
+  "projid", "Global.cognitive.function_intercept",
+  "Global.cognitive.function_slope"
+)
+check_columns(cog, cognition_columns, "Cognition data")
+check_columns(
+  phe, c("projid", "Methylation_id", "braaksc", "msex", "age_death", "pmi"),
+  "Phenotype data"
+)
+check_columns(minf, c("specimenID", "Sentrix_ID", "batch"), "Metadata")
+
+# As in the original analysis, retain the first cognition record per projid.
+cog_sub <- cog[!duplicated(cog$projid), cognition_columns, drop = FALSE]
+minf$Methylation_id <- gsub("-", "_", minf$specimenID, fixed = TRUE)
+
+# 3. Align samples -------------------------------------------------------------
+
+phe2 <- merge(phe, cog_sub, by = "projid", all.x = TRUE)
+phe2 <- merge(
+  phe2, minf[, c("Methylation_id", "Sentrix_ID", "batch"), drop = FALSE],
+  by = "Methylation_id", all.x = TRUE
+)
+phe2$methy_id <- gsub("_", ".", phe2$Methylation_id, fixed = TRUE)
+
+# Eligibility assumes that the supplied methylation data have already passed QC.
+eligible <- !is.na(phe2$methy_id) & nzchar(phe2$methy_id) &
+  !is.na(phe2$Global.cognitive.function_slope)
+phe2_sub <- phe2[eligible, , drop = FALSE]
+
+sample_columns <- which(
+  seq_len(ncol(methy)) > 1L & colnames(methy) %in% phe2_sub$methy_id
+)
+sample_ids <- colnames(methy)[sample_columns]
+if (length(sample_ids) == 0L) {
+  stop("No methylation sample IDs match the eligible phenotype records.")
+}
+matched_ids <- phe2_sub$methy_id[phe2_sub$methy_id %in% sample_ids]
+if (anyDuplicated(sample_ids) || anyDuplicated(matched_ids)) {
+  stop("Duplicate methylation sample IDs: resolve duplicates before analysis.")
+}
+
+phe2_sub <- phe2_sub[match(sample_ids, phe2_sub$methy_id), , drop = FALSE]
+stopifnot(identical(sample_ids, phe2_sub$methy_id))
+
+# Optional CpG blocks support separate computing jobs using the same sample set.
+if (is.null(group)) {
+  cpg_rows <- seq_len(nrow(methy))
+  output_suffix <- "all_cpgs"
+} else {
+  start_row <- (group - 1) * chunk_size + 1
+  if (start_row > nrow(methy)) {
+    stop("group exceeds the number of available CpG blocks.")
+  }
+  end_row <- min(group * chunk_size, nrow(methy))
+  cpg_rows <- seq.int(start_row, end_row)
+  output_suffix <- paste0("group_", format(group, scientific = FALSE, trim = TRUE))
+}
+
+cpgs <- as.character(methy[cpg_rows, 1L])
+Zsub <- as.matrix(methy[cpg_rows, sample_columns, drop = FALSE])
+rm(methy)
+stopifnot(identical(colnames(Zsub), phe2_sub$methy_id))
+
+# 4. Format covariates ---------------------------------------------------------
+
+# Braak stages 0-2 are the reference category, as in the original script.
+phe2_sub$stage2 <- as.numeric(phe2_sub$braaksc > 2 & phe2_sub$braaksc < 5)
+phe2_sub$stage3 <- as.numeric(phe2_sub$braaksc >= 5)
+phe2_sub$slope <- phe2_sub$Global.cognitive.function_slope
+phe2_sub$intercept <- phe2_sub$Global.cognitive.function_intercept
+phe2_sub$female <- 1 - phe2_sub$msex
+phe2_sub$slide <- factor(phe2_sub$Sentrix_ID)
+# Preserve the input coding of batch, consistent with the original model.
+
+# 5. Fit each CpG model once using the full eligible sample ----------------------
+
+model_formula <- y ~ slope + intercept + age_death + female + pmi +
+  stage2 + stage3 + slide + batch
+
+results <- data.frame(
+  coef = rep(NA_real_, length(cpgs)),
+  se = rep(NA_real_, length(cpgs)),
+  pval = rep(NA_real_, length(cpgs)),
+  cpgs = cpgs,
+  n = rep(NA_integer_, length(cpgs))
+)
+
+message("Eligible aligned samples: ", nrow(phe2_sub))
+message("CpGs to analyze: ", length(cpgs))
+
+for (i in seq_along(cpgs)) {
+  phe2_sub$y <- as.numeric(Zsub[i, ])
+  fit <- tryCatch(
+    lm(model_formula, data = phe2_sub, na.action = na.omit),
+    error = function(e) {
+      stop("Model failed for ", cpgs[i], ": ", conditionMessage(e), call. = FALSE)
+    }
+  )
+  coefficient_table <- summary(fit)$coefficients
+
+  # Extract slope by name so a dropped term cannot shift the selected row.
+  # If slope is not estimable, retain NA for its estimate, SE, and P value.
+  if ("slope" %in% rownames(coefficient_table)) {
+    results$coef[i] <- coefficient_table["slope", "Estimate"]
+    results$se[i] <- coefficient_table["slope", "Std. Error"]
+    results$pval[i] <- coefficient_table["slope", "Pr(>|t|)"]
+  }
+  results$n[i] <- nobs(fit)
+
+  if (i %% 1000L == 0L || i == length(cpgs)) {
+    message("Completed ", i, " / ", length(cpgs), " CpGs")
+  }
+}
+
+# 6. Save tab-separated results ------------------------------------------------
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(output_dir)) {
+  stop("Could not create output directory: ", output_dir)
+}
+output_file <- file.path(
+  output_dir,
+  paste0("Methy_on_globalcog_slope_full_sample_", output_suffix, ".tsv")
+)
+data.table::fwrite(results, file = output_file, sep = "\t", quote = FALSE, na = "NA")
+message("Results saved to: ", output_file)
