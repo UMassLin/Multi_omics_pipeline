@@ -1,0 +1,255 @@
+#!/usr/bin/env Rscript
+
+# RNA-seq associations with global cognitive slope in ROSMAP.
+# Each gene is analyzed once using all eligible aligned samples. Missing model
+# values are omitted separately for each gene. No random subsampling is used.
+#
+# Dependency (install in R): install.packages("data.table")
+# Usage (run in a terminal):
+#   Rscript rnaseq.globcog.slope.R [data_dir] [output_dir] [group]
+# Examples:
+#   Rscript rnaseq.globcog.slope.R data expression_res
+#   Rscript rnaseq.globcog.slope.R data expression_res 1
+# Omit group to analyze all genes. A group selects 5,000 gene rows only;
+# it does not select or divide participants. The final group may be smaller.
+# Positional arguments replace the original R.utils / -g interface.
+
+# 1. Dependencies and configuration --------------------------------------------
+
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  stop("Install data.table first: install.packages('data.table')")
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 3L) {
+  stop("Usage: Rscript rnaseq.globcog.slope.R [data_dir] [output_dir] [group]")
+}
+
+data_dir <- if (length(args) >= 1L) args[1L] else "data"
+output_dir <- if (length(args) >= 2L) args[2L] else "expression_res"
+group <- if (length(args) >= 3L) suppressWarnings(as.numeric(args[3L])) else NULL
+chunk_size <- 5000L
+
+# Set this to the RNA sample-ID column name when known. NULL preserves the
+# original script's column 22 AFTER merging phenotype and cognition data.
+rna_id_column <- NULL
+
+if (!is.null(group) &&
+    (!is.finite(group) || group < 1 || group != floor(group))) {
+  stop("group must be a positive integer, or omitted to analyze all genes.")
+}
+
+# Place these files in data_dir, or edit their paths here.
+input_paths <- c(
+  rna_plates_1_to_6 = file.path(
+    data_dir, "ROSMAP_RNAseq_FPKM_gene_plates_1_to_6_normalized.tsv"
+  ),
+  rna_plates_7_to_8 = file.path(
+    data_dir, "ROSMAP_RNAseq_FPKM_gene_plates_7_to_8_normalized.tsv"
+  ),
+  phenotype = file.path(data_dir, "Phenotype.ROSMAP.txt"),
+  cognition = file.path(data_dir, "df_LMM_Kmeans_trajectory_groups.csv"),
+  metadata = file.path(data_dir, "ROSMAP_assay_rnaSeq_metadata.csv")
+)
+
+missing_files <- input_paths[!file.exists(input_paths)]
+if (length(missing_files) > 0L) {
+  stop("Missing input files:\n", paste(missing_files, collapse = "\n"))
+}
+
+check_columns <- function(x, required, label) {
+  missing <- setdiff(required, names(x))
+  if (length(missing) > 0L) {
+    stop(label, " is missing columns: ", paste(missing, collapse = ", "))
+  }
+}
+
+# 2. Load RNA-seq, phenotype, cognition, and assay data ---------------------------
+
+rna1 <- data.table::fread(
+  input_paths[["rna_plates_1_to_6"]], data.table = FALSE,
+  colClasses = c(gene_id = "character")
+)
+rna2 <- data.table::fread(
+  input_paths[["rna_plates_7_to_8"]], data.table = FALSE,
+  colClasses = c(gene_id = "character")
+)
+phe <- data.table::fread(
+  input_paths[["phenotype"]], data.table = FALSE,
+  colClasses = c(projid = "character")
+)
+cog <- data.table::fread(
+  input_paths[["cognition"]], data.table = FALSE,
+  colClasses = c(projid = "character")
+)
+assay <- data.table::fread(
+  input_paths[["metadata"]], data.table = FALSE,
+  colClasses = c(specimenID = "character")
+)
+
+cognition_columns <- c(
+  "projid", "Global.cognitive.function_intercept",
+  "Global.cognitive.function_slope"
+)
+check_columns(rna1, "gene_id", "RNA-seq plates 1-6")
+check_columns(rna2, "gene_id", "RNA-seq plates 7-8")
+check_columns(phe, c("projid", "braaksc", "msex", "age_death", "pmi"), "Phenotype data")
+check_columns(cog, cognition_columns, "Cognition data")
+check_columns(assay, c("specimenID", "RIN", "sequencingBatch"), "Assay metadata")
+
+if (nrow(rna1) == 0L || ncol(rna1) < 3L || ncol(rna2) < 3L) {
+  stop("RNA-seq files must contain gene rows, two annotation columns, and sample columns.")
+}
+if (!identical(rna1$gene_id, rna2$gene_id)) {
+  stop("RNA-seq files must contain the same gene IDs in the same row order.")
+}
+
+# As in the original analysis, retain the first cognition record per projid.
+cog_sub <- cog[!duplicated(cog$projid), cognition_columns, drop = FALSE]
+phe2 <- merge(phe, cog_sub, by = "projid", all.x = TRUE)
+
+if (is.null(rna_id_column)) {
+  if (ncol(phe2) < 22L) {
+    stop("Set rna_id_column to the RNA sample-ID column name in the configuration.")
+  }
+  rna_id_column <- names(phe2)[22L]
+}
+check_columns(phe2, rna_id_column, "Merged phenotype/cognition data")
+message("RNA sample-ID column: ", rna_id_column)
+phe2$rna_id <- as.character(phe2[[rna_id_column]])
+
+# 3. Resolve RNA sample IDs and align participants -------------------------------
+
+# Plates 7-8 lack the batch suffix in the original phenotype sample IDs.
+# Retain the original batch78 definition: 1 when that ID appears in specimenID.
+# Metadata must identify each specimen unambiguously.
+assay <- assay[!is.na(assay$specimenID) & nzchar(assay$specimenID), , drop = FALSE]
+if (anyDuplicated(assay$specimenID)) {
+  stop("Duplicate specimenID values in assay metadata: resolve them before analysis.")
+}
+
+phe2$batch78 <- as.numeric(phe2$rna_id %in% assay$specimenID)
+needs_suffix <- which(phe2$batch78 == 1L)
+assay_index <- match(phe2$rna_id[needs_suffix], assay$specimenID)
+batch_suffix <- as.character(assay$sequencingBatch[assay_index])
+if (anyNA(batch_suffix) || any(!nzchar(batch_suffix))) {
+  stop("Missing sequencingBatch for RNA sample IDs that need a batch suffix.")
+}
+phe2$rna_id[needs_suffix] <- paste0(
+  phe2$rna_id[needs_suffix], "_", batch_suffix
+)
+
+# Remove the final underscore-delimited batch suffix for metadata matching.
+# This also handles batch labels longer than one character.
+phe2$rna_id_nobatch <- sub("_[^_]+$", "", phe2$rna_id)
+assay_index <- match(phe2$rna_id_nobatch, assay$specimenID)
+phe2$RIN <- assay$RIN[assay_index]
+
+# Eligibility assumes that supplied expression data have already passed QC.
+eligible <- !is.na(phe2$rna_id) & nzchar(phe2$rna_id) &
+  !is.na(phe2$Global.cognitive.function_slope)
+phe2_sub <- phe2[eligible, , drop = FALSE]
+
+# The first two columns of each expression file are annotations, as originally.
+genes <- rna1$gene_id
+rna_all <- cbind(
+  rna1[, -c(1L, 2L), drop = FALSE],
+  rna2[, -c(1L, 2L), drop = FALSE]
+)
+rm(rna1, rna2)
+
+sample_ids <- colnames(rna_all)[colnames(rna_all) %in% phe2_sub$rna_id]
+if (length(sample_ids) == 0L) {
+  stop("No RNA-seq sample IDs match eligible phenotype records; check rna_id_column.")
+}
+matched_ids <- phe2_sub$rna_id[phe2_sub$rna_id %in% sample_ids]
+if (anyDuplicated(sample_ids) || anyDuplicated(matched_ids)) {
+  stop("Duplicate matched RNA sample IDs: resolve them before analysis.")
+}
+phe2_sub_order <- phe2_sub[match(sample_ids, phe2_sub$rna_id), , drop = FALSE]
+stopifnot(identical(sample_ids, phe2_sub_order$rna_id))
+
+# Optional gene blocks support separate jobs using the same participant set.
+if (is.null(group)) {
+  gene_rows <- seq_along(genes)
+  output_suffix <- "all_genes"
+} else {
+  start_row <- (group - 1) * chunk_size + 1
+  if (start_row > length(genes)) {
+    stop("group exceeds the number of available gene blocks.")
+  }
+  end_row <- min(group * chunk_size, length(genes))
+  gene_rows <- seq.int(start_row, end_row)
+  output_suffix <- paste0("group_", format(group, scientific = FALSE, trim = TRUE))
+}
+genes <- genes[gene_rows]
+Zsub <- as.matrix(rna_all[gene_rows, sample_ids, drop = FALSE])
+rm(rna_all)
+stopifnot(identical(colnames(Zsub), phe2_sub_order$rna_id))
+
+# 4. Format covariates ---------------------------------------------------------
+
+# Braak stages 0-2 are the reference category.
+phe2_sub_order$stage2 <- as.numeric(
+  phe2_sub_order$braaksc > 2 & phe2_sub_order$braaksc < 5
+)
+phe2_sub_order$stage3 <- as.numeric(phe2_sub_order$braaksc >= 5)
+phe2_sub_order$slope <- phe2_sub_order$Global.cognitive.function_slope
+phe2_sub_order$intercept <- phe2_sub_order$Global.cognitive.function_intercept
+# Original coding: msex = 1 for men and 0 for women.
+phe2_sub_order$female <- 1 - phe2_sub_order$msex
+
+# 5. Fit each gene model once using the full eligible sample ---------------------
+
+# Preserve the original response transformation and regression formula.
+model_formula <- y ~ slope + intercept + age_death + female + pmi +
+  stage2 + stage3 + RIN + batch78
+
+results <- data.frame(
+  coef = rep(NA_real_, length(genes)),
+  se = rep(NA_real_, length(genes)),
+  pval = rep(NA_real_, length(genes)),
+  genes_id = genes,
+  n = rep(NA_integer_, length(genes))
+)
+message("Eligible aligned samples: ", nrow(phe2_sub_order))
+message("Genes to analyze: ", length(genes))
+
+for (i in seq_along(genes)) {
+  phe2_sub_order$y <- log2(as.numeric(Zsub[i, ]) + 1)
+  fit <- tryCatch(
+    lm(model_formula, data = phe2_sub_order, na.action = na.omit),
+    error = function(e) {
+      stop("Model failed for ", genes[i], ": ", conditionMessage(e), call. = FALSE)
+    }
+  )
+  coefficient_table <- summary(fit)$coefficients
+
+  # Select slope by name; a non-estimable slope remains NA.
+  if ("slope" %in% rownames(coefficient_table)) {
+    results$coef[i] <- coefficient_table["slope", "Estimate"]
+    results$se[i] <- coefficient_table["slope", "Std. Error"]
+    results$pval[i] <- coefficient_table["slope", "Pr(>|t|)"]
+  }
+  results$n[i] <- nobs(fit)
+
+  if (i %% 1000L == 0L || i == length(genes)) {
+    message("Completed ", i, " / ", length(genes), " genes")
+  }
+}
+
+# 6. Save results --------------------------------------------------------------
+
+# Output: one row per gene, with coef, se, pval, genes_id, and n.
+# pval is unadjusted; n is the number of complete observations in that model.
+# Re-running the same command replaces the corresponding output file.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(output_dir)) {
+  stop("Could not create output directory: ", output_dir)
+}
+output_file <- file.path(
+  output_dir,
+  paste0("RNAseq_on_globalcog_slope_full_sample_", output_suffix, ".tsv")
+)
+data.table::fwrite(results, file = output_file, sep = "\t", quote = FALSE, na = "NA")
+message("Results saved to: ", output_file)
