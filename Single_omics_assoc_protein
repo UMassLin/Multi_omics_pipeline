@@ -1,0 +1,183 @@
+#!/usr/bin/env Rscript
+
+# Brain proteomics associations with global cognitive slope in ROSMAP.
+# Each protein is analyzed once using all eligible aligned samples. Missing
+# model values are omitted separately for each protein. No resampling is used.
+#
+# Dependency (install in R): install.packages("data.table")
+# Usage (run in a terminal):
+#   Rscript brain.proteom.globcog.slope.R [data_dir] [output_dir]
+# Example:
+#   Rscript brain.proteom.globcog.slope.R data proteomic_res
+# Defaults: read inputs from data and write results to proteomic_res.
+
+# 1. Dependencies and configuration --------------------------------------------
+
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  stop("Install data.table first: install.packages('data.table')")
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 2L) {
+  stop("Usage: Rscript brain.proteom.globcog.slope.R [data_dir] [output_dir]")
+}
+data_dir <- if (length(args) >= 1L) args[1L] else "data"
+output_dir <- if (length(args) >= 2L) args[2L] else "proteomic_res"
+
+# Place the three inputs in data_dir, or edit their paths here.
+# The .cvs extension below is retained from the original input filename.
+input_paths <- c(
+  proteomics = file.path(
+    data_dir, "Two_rounds_combined_batchcorrected_log2_7825x589.cvs"
+  ),
+  phenotype = file.path(data_dir, "ROSMAP_clinical.csv"),
+  cognition = file.path(data_dir, "df_LMM_Kmeans_trajectory_groups.csv")
+)
+
+missing_files <- input_paths[!file.exists(input_paths)]
+if (length(missing_files) > 0L) {
+  stop("Missing input files:\n", paste(missing_files, collapse = "\n"))
+}
+
+check_columns <- function(x, required, label) {
+  missing <- setdiff(required, names(x))
+  if (length(missing) > 0L) {
+    stop(label, " is missing columns: ", paste(missing, collapse = ", "))
+  }
+}
+
+# 2. Load proteomics, phenotype, and cognition data -------------------------------
+
+# Expected proteomics format: protein IDs in column 1 and expression values
+# in all remaining columns, with participant IDs as the sample column names.
+# Values are already batch-corrected and log2-transformed, as in the original
+# analysis. No additional transformation is applied by this script.
+prot <- data.table::fread(
+  input_paths[["proteomics"]], header = TRUE, data.table = FALSE,
+  colClasses = list(character = 1L)
+)
+phe <- data.table::fread(
+  input_paths[["phenotype"]], data.table = FALSE,
+  colClasses = c(projid = "character", age_death = "character")
+)
+cog <- data.table::fread(
+  input_paths[["cognition"]], data.table = FALSE,
+  colClasses = c(projid = "character")
+)
+
+if (nrow(prot) == 0L || ncol(prot) < 2L) {
+  stop("Proteomics data must contain protein rows and at least one sample column.")
+}
+check_columns(
+  phe, c("projid", "age_death", "msex", "pmi", "braaksc"), "Phenotype data"
+)
+cognition_columns <- c(
+  "projid", "Global.cognitive.function_intercept",
+  "Global.cognitive.function_slope"
+)
+check_columns(cog, cognition_columns, "Cognition data")
+
+# 3. Align samples -------------------------------------------------------------
+
+protein_ids <- as.character(prot[[1L]])
+proteomics_sample_ids <- names(prot)[-1L]
+phe_sub <- phe[phe$projid %in% proteomics_sample_ids, , drop = FALSE]
+
+# As in the original analysis, retain the first cognition record per projid.
+cog_sub <- cog[!duplicated(cog$projid), cognition_columns, drop = FALSE]
+phe1 <- merge(phe_sub, cog_sub, by = "projid", all.x = TRUE)
+
+# Inputs are assumed to have already passed proteomics QC. Retain participants
+# with available global cognitive slope and matching proteomics sample IDs.
+eligible <- !is.na(phe1$projid) & nzchar(phe1$projid) &
+  !is.na(phe1$Global.cognitive.function_slope)
+phe2 <- phe1[eligible, , drop = FALSE]
+sample_ids <- proteomics_sample_ids[proteomics_sample_ids %in% phe2$projid]
+
+if (length(sample_ids) == 0L) {
+  stop("No proteomics sample IDs match eligible phenotype records.")
+}
+matched_ids <- phe2$projid[phe2$projid %in% sample_ids]
+if (anyDuplicated(sample_ids) || anyDuplicated(matched_ids)) {
+  stop("Duplicate matched participant IDs: resolve them before analysis.")
+}
+
+# Select samples by position to exclude the protein-ID column explicitly.
+sample_columns <- which(
+  seq_len(ncol(prot)) > 1L & names(prot) %in% sample_ids
+)
+Zsub <- as.matrix(prot[, sample_columns, drop = FALSE])
+phe2_sub <- phe2[match(colnames(Zsub), phe2$projid), , drop = FALSE]
+stopifnot(identical(colnames(Zsub), phe2_sub$projid))
+rm(prot)
+
+# 4. Format covariates ---------------------------------------------------------
+
+phe2_sub$slope <- phe2_sub$Global.cognitive.function_slope
+phe2_sub$intercept <- phe2_sub$Global.cognitive.function_intercept
+# Original coding: msex = 1 for men and 0 for women.
+phe2_sub$female <- 1 - phe2_sub$msex
+
+# Braak stages 0-2 are the reference category.
+phe2_sub$stage2 <- as.numeric(phe2_sub$braaksc > 2 & phe2_sub$braaksc < 5)
+phe2_sub$stage3 <- as.numeric(phe2_sub$braaksc >= 5)
+
+# Preserve the original convention of coding "90+" as 90 years.
+phe2_sub$age_death <- as.numeric(
+  ifelse(phe2_sub$age_death == "90+", "90", phe2_sub$age_death)
+)
+
+# 5. Fit each protein model once using the full eligible sample ------------------
+
+# Preserve the original regression formula. APOE was not included in this model.
+model_formula <- y ~ slope + intercept + age_death + female + pmi +
+  stage2 + stage3
+
+results <- data.frame(
+  coef = rep(NA_real_, length(protein_ids)),
+  se = rep(NA_real_, length(protein_ids)),
+  pval = rep(NA_real_, length(protein_ids)),
+  prot_id = protein_ids,
+  n = rep(NA_integer_, length(protein_ids))
+)
+message("Eligible aligned samples: ", nrow(phe2_sub))
+message("Proteins to analyze: ", length(protein_ids))
+
+for (i in seq_along(protein_ids)) {
+  phe2_sub$y <- as.numeric(Zsub[i, ])
+  fit <- tryCatch(
+    lm(model_formula, data = phe2_sub, na.action = na.omit),
+    error = function(e) {
+      stop("Model failed for ", protein_ids[i], ": ", conditionMessage(e), call. = FALSE)
+    }
+  )
+  coefficient_table <- summary(fit)$coefficients
+
+  # Select slope by name; a non-estimable slope remains NA.
+  if ("slope" %in% rownames(coefficient_table)) {
+    results$coef[i] <- coefficient_table["slope", "Estimate"]
+    results$se[i] <- coefficient_table["slope", "Std. Error"]
+    results$pval[i] <- coefficient_table["slope", "Pr(>|t|)"]
+  }
+  results$n[i] <- nobs(fit)
+
+  if (i %% 1000L == 0L || i == length(protein_ids)) {
+    message("Completed ", i, " / ", length(protein_ids), " proteins")
+  }
+}
+
+# 6. Save results --------------------------------------------------------------
+
+# Output: one row per protein, with coef, se, pval, prot_id, and n.
+# coef is the global cognitive slope coefficient; se is its standard error;
+# pval is its unadjusted, two-sided P value; n is the fitted sample size.
+# There is no folds column. Re-running the script replaces this output file.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(output_dir)) {
+  stop("Could not create output directory: ", output_dir)
+}
+output_file <- file.path(
+  output_dir, "Brain_proteomics_on_globalcog_slope_full_sample.tsv"
+)
+data.table::fwrite(results, file = output_file, sep = "\t", quote = FALSE, na = "NA")
+message("Results saved to: ", output_file)
